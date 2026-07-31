@@ -110,6 +110,17 @@ function host.millis()
     return host._millis_counter
 end
 
+-- host.sleep is in spec/host-api.md and the real host provides it, so a driver
+-- that needs a gap between writes calls it. The mock did not have it, and Lua
+-- turns a missing field into "attempt to call a nil value" -- so any test that
+-- reached solis's or deye's write-retry path died there rather than measuring
+-- it. Advance the clock instead of sleeping: tests must stay fast, and a
+-- driver that reads the clock either side of a gap should see one.
+function host.sleep(milliseconds)
+    record_call("sleep", milliseconds)
+    host._millis_counter = host._millis_counter + (tonumber(milliseconds) or 0)
+end
+
 function host.set_make(name)
     record_call("set_make", name)
     host._make = name
@@ -197,7 +208,7 @@ function host.modbus_read(addr, count, kind)
 
     local read_error = host._modbus_read_fail_addresses[addr] or host._modbus_read_error
     if read_error then
-        error(tostring(read_error))
+        return nil, tostring(read_error)
     end
 
     local short_count = host._modbus_read_short_counts[addr]

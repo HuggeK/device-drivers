@@ -54,6 +54,107 @@ one that takes a site down:
 `optional_read` in the blueprint does the second. `detect_model` does the
 first, and bounds itself too.
 
+### What this looks like in a shipped driver
+
+Most Modbus drivers here route every read through one helper. Copy it, change
+the manufacturer name, and use it everywhere the driver reads a register:
+
+```lua
+local GIVE_UP_AFTER = 3
+local read_failures = {}
+
+local function probe_read(addr, count, kind)
+    if (read_failures[addr] or 0) >= GIVE_UP_AFTER then return nil end
+    local ok, regs = pcall(host.modbus_read, addr, count, kind)
+    if ok and regs and regs[1] ~= nil then
+        read_failures[addr] = nil
+        return regs
+    end
+    local failures = (read_failures[addr] or 0) + 1
+    read_failures[addr] = failures
+    if failures == GIVE_UP_AFTER then
+        host.log("info", string.format(
+            "Example: register %d did not answer %d times; leaving it alone " ..
+            "until restart", addr, GIVE_UP_AFTER))
+    end
+    return nil
+end
+```
+
+Three attempts rather than one: a single failure is not proof a register is
+missing, and the link may just have been slow. Bounded is the property that
+matters, not the number. A restart re-probes, so firmware that gains the
+register is picked up without anyone editing the driver.
+
+Wrap the driver's own typed helpers — `read_i16`, `read_u32_be` and the like —
+around `probe_read` rather than giving each its own `pcall`. That fixes every
+call site at once and leaves one place to reason about.
+
+### Check your driver before you open the pull request
+
+```bash
+make absent-register-report ID=example
+```
+
+It takes every register your driver reads, makes that one stop answering, and
+watches ten polls. A line ending `SETTLED 0` with `EMITTED` above zero is the
+outage: the driver decided it can live without the register and then went on
+paying for it.
+
+`drivers/tests/test_absent_register_settles.py` holds every driver to this.
+A new driver must be clean. The drivers that already carried this debt when it
+was first measured are listed in `absent-register-baseline.json`, and that file
+may only shrink.
+
+## The same rule for writes
+
+A device can refuse a write as easily as it can fail a read, and one path
+writes without anyone asking: `driver_default_mode()`. The host calls it on
+lease expiry, on the telemetry watchdog, on shutdown. Nothing there can say no,
+so a driver that writes whatever the device answers goes on writing for the
+life of the session, one log line per tick.
+
+Count refusals the way you count missed reads, and stop:
+
+```lua
+local WRITE_ATTEMPTS = 3
+local write_failures = 0
+
+local function block_worth_writing()
+    return write_failures < WRITE_ATTEMPTS
+end
+
+local function note_write(err)
+    if err == nil or err == "" then
+        write_failures = 0   -- one success proves the register is there
+    else
+        write_failures = write_failures + 1
+    end
+end
+```
+
+Three rather than one, for the same reason as reads: a busy bus is not proof.
+The count lives in the process, so a restart always tries once — which is what
+the startup reset is for. A single success clears it, so firmware that gains
+the register is picked up without waiting for a restart.
+
+Do not gate this on the model instead. The device can be holding a state your
+driver did not set — a container that died mid-command, an older driver
+version, another EMS on the same bus — and a model label tells you nothing
+about that. Whether the device took the write does.
+
+Once it has given up, report the default as held rather than failed. A
+permanent `false` has the watchdog escalate against a device that was never
+under control.
+
+```bash
+make refused-write-report ID=example
+```
+
+`drivers/tests/test_refused_write_settles.py` holds every driver to this, with
+`refused-write-baseline.json` recording what already shipped. `sungrow` is the
+worked example, and the only one clean when this was first measured.
+
 ## Sign convention
 
 **Positive watts flow into the site.** Every driver, every device, no

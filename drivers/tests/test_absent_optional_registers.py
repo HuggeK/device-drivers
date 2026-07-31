@@ -1,0 +1,150 @@
+"""A register the firmware does not carry must be given up on, not read forever.
+
+The host counts every failed `host.modbus_read` toward the driver-poll error
+tally, whether or not Lua caught the error with pcall. So a driver that keeps
+re-reading an absent optional register sits at "1 of N reads failed" forever,
+the stale-telemetry watchdog marks it offline, and telemetry stops reaching
+the planner. Both cases below were found on customer hardware.
+
+The drivers spend a bounded number of attempts and then stop. These two cases
+are pinned here by name because they are the ones that reached customers;
+`test_absent_register_settles.py` holds every driver to the same property.
+
+The Lua harness in lua_harness/ covers the same ground, but CI only runs
+pytest, so the guard has to live here to hold.
+"""
+
+import subprocess
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[2]
+LUA = ROOT / "lua55"
+HARNESS = ROOT / "drivers" / "tests" / "lua_harness"
+
+# Poll well past the point a driver should have given up, so a total read
+# count below the attempt budget proves it stopped rather than merely
+# started slowly.
+POLLS = 6
+
+# What a driver may spend on a register before leaving it alone. One failure
+# is not proof a register is missing — the link may just have been slow — so
+# the drivers retry a bounded number of times and then stop. Bounded is the
+# property that matters; the exact bound is a judgement call, and this is the
+# one sungrow already used.
+GIVE_UP_AFTER = 3
+
+pytestmark = pytest.mark.skipif(
+    not LUA.exists(), reason="run make check to build ./lua55")
+
+
+def run_lua(body: str) -> dict[str, str]:
+    script = f'''
+package.path = "{HARNESS}/?.lua;" .. package.path
+require("host_mock")
+host.reset()
+
+-- Fill every register with a plausible value so an unpatched read succeeds.
+local holding = {{}}
+for addr = 0, 65535 do holding[addr] = 100 end
+host._modbus_registers.holding = holding
+host._modbus_registers.input = holding
+
+function count_reads(addr)
+    local n = 0
+    for _, call in ipairs(host._calls) do
+        if call.func == "modbus_read" and call.args[1] == addr then n = n + 1 end
+    end
+    return n
+end
+
+{body}
+'''
+    result = subprocess.run([str(LUA), "-e", script],
+                            capture_output=True, text=True, cwd=ROOT)
+    assert result.returncode == 0, result.stdout + result.stderr
+    return dict(line.split(" ", 1)
+                for line in result.stdout.strip().splitlines() if " " in line)
+
+
+def poll_with_absent(path: Path, absent: int, present: int,
+                     config: str = "{}") -> dict[str, str]:
+    return run_lua(f'''
+host._modbus_read_fail_addresses[{absent}] = "Illegal Data Address"
+dofile("{path}")
+driver_init({config})
+for poll = 1, {POLLS} do
+    local ok, err = pcall(driver_poll)
+    if not ok then print("POLL_ERROR " .. tostring(err)) os.exit(1) end
+end
+print("ABSENT_READS " .. count_reads({absent}))
+print("PRESENT_READS " .. count_reads({present}))
+local streams = 0
+for _, kind in ipairs({{"pv", "battery", "meter"}}) do
+    local emitted = host._emitted[kind]
+    if emitted and #emitted > 0 then streams = streams + 1 end
+end
+print("STREAMS " .. streams)
+''')
+
+
+# The catalog driver and the package target are separate files that both ship.
+# Fixing one and not the other is what let this bug come back: #16 patched both,
+# #27 overwrote only the catalog copy, and the package target's own test stayed
+# green while the flap reached customer hardware. Hold both to the same rule.
+PIXII_SOURCES = {
+    "catalog": ROOT / "drivers" / "lua" / "pixii.lua",
+    "package-target": ROOT / "packages" / "v1" / "pixii" / "targets" / "ftw.lua",
+}
+
+
+@pytest.mark.parametrize("source", sorted(PIXII_SOURCES), ids=sorted(PIXII_SOURCES))
+def test_pixii_gives_up_on_an_absent_scale_factor(source):
+    """40288 meter_energy_sf is absent on PowerShaper firmware below CPU 2.0.23."""
+    out = poll_with_absent(PIXII_SOURCES[source], absent=40288, present=40256,
+                           config="{host = '127.0.0.1', port = 502, unit_id = 1}")
+
+    assert int(out["ABSENT_READS"]) <= GIVE_UP_AFTER, (
+        f"pixii {source} read absent 40288 {out['ABSENT_READS']} times over "
+        f"{POLLS} polls, so it never stopped. Every failed read counts against "
+        f"the poll and takes the driver offline; the budget is {GIVE_UP_AFTER}."
+    )
+    # Caching absence must not freeze a scale factor the firmware does carry.
+    assert int(out["PRESENT_READS"]) >= POLLS, (
+        f"pixii {source} stopped re-reading meter power SF 40256, which is present"
+    )
+    assert int(out["STREAMS"]) >= 2, (
+        f"pixii {source} stopped telemetry when 40288 is absent"
+    )
+
+
+def test_solaredge_legacy_gives_up_on_an_absent_mppt_block():
+    """K-series firmware does not populate the proprietary MPPT block at 40123."""
+    out = run_lua(f'''
+-- The driver refuses a device that does not answer the SunSpec magic.
+host._modbus_registers.holding[40000] = 0x5375
+host._modbus_registers.holding[40001] = 0x6e53
+host._modbus_read_fail_addresses[40123] = "Illegal Data Address"
+dofile("{ROOT}/drivers/lua/solaredge_legacy.lua")
+driver_init({{host = '127.0.0.1', port = 502, unit_id = 1, nominal_w = 17000}})
+for poll = 1, {POLLS} do
+    local ok, err = pcall(driver_poll)
+    if not ok then print("POLL_ERROR " .. tostring(err)) os.exit(1) end
+end
+print("ABSENT_READS " .. count_reads(40123))
+print("PRESENT_READS " .. count_reads(40069))
+print("PV " .. ((host._emitted.pv and #host._emitted.pv) or 0))
+''')
+
+    assert int(out["ABSENT_READS"]) <= GIVE_UP_AFTER, (
+        f"solaredge_legacy read absent 40123 {out['ABSENT_READS']} times over "
+        f"{POLLS} polls, so it never stopped; the budget is {GIVE_UP_AFTER}."
+    )
+    # Model 103 carries AC power and must keep flowing.
+    assert int(out["PRESENT_READS"]) >= POLLS, (
+        "solaredge_legacy stopped reading the Model 103 block"
+    )
+    assert int(out["PV"]) >= POLLS, (
+        "solaredge_legacy stopped PV telemetry when the MPPT block is absent"
+    )

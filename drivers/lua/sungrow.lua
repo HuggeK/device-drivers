@@ -9,7 +9,7 @@ DRIVER = {
   id           = "sungrow-shx",
   name         = "Sungrow SH Hybrid Inverter",
   manufacturer = "Sungrow",
-  version      = "1.5.0",
+  version      = "1.5.7",
   protocols    = { "modbus" },
   capabilities = { "meter", "pv", "battery", "pv-curtail" },
   description  = "Sungrow SH-series hybrid inverters with LFP battery, via Modbus TCP.",
@@ -100,6 +100,14 @@ end
 
 local model_family = nil -- "hybrid", "string", "unknown", or nil while asking
 
+-- Set once the battery registers have actually answered. The device type code
+-- is the fast answer to "does this have a battery"; this is the slow one, and
+-- it is the only one available when register 4999 never answers. The control
+-- path needs it: `unknown` is a state the read path may probe its way out of,
+-- because a failed read is bounded and self-correcting, while a write to a
+-- register the model does not implement is neither.
+local battery_confirmed = false
+
 -- Detection has to give up. Retrying a register the inverter never answers
 -- costs one failed read on every poll for the rest of the session, which is
 -- the same outage by a slower route.
@@ -128,9 +136,91 @@ local function hybrid_block_worth_reading()
     return model_family == "hybrid" or model_family == "unknown"
 end
 
+-- Whether the device has named itself a model with no battery registers.
+--
+-- Read this narrowly. It gates startup *reads* of the battery limit block and
+-- nothing else. It must never gate a write that clears a forced state, because
+-- a device this function calls "string" can still be holding EMS mode 2 --
+-- left there by an earlier run, or by a firmware that answers the type
+-- register differently after an update -- and set_self_consumption is the only
+-- thing that writes mode 0 back. Being classified here is not proof there is
+-- nothing to release: a hybrid shipped under a device-type family
+-- classify_device_type has not been taught lands in exactly this branch.
+local function known_to_have_no_battery()
+    return model_family == "string"
+end
+
+----------------------------------------------------------------------------
+-- The EMS control block, 13049-13051
+--
+-- The write-side twin of the register probe below, and it needs the same
+-- rule: absence has to be proved, and once proved, stop paying for it.
+--
+-- An SG string inverter rejects every write here with a Modbus exception. The
+-- driver retried three of them at startup and three more on every watchdog
+-- tick for the life of the session -- an SG12RT logged "self-consumption reset
+-- write failed" once per tick, indefinitely, while it was already offline for
+-- an unrelated reason.
+--
+-- Deliberately NOT gated on model_family, which is the obvious fix and the
+-- wrong one. The startup reset exists because the inverter can be holding a
+-- forced state this driver did not set: a container that died mid-force, an
+-- older driver version, iSolarCloud or another EMS on the same bus. None of
+-- those care what classify_device_type decided, and a hybrid shipped under a
+-- device-type code this driver has not been taught is classified "string".
+-- Skipping the release on the label would leave exactly that inverter forced,
+-- with nothing left that writes mode 0 back.
+--
+-- What separates the two cases is not the label but whether the device took
+-- the write. One that rejects it cannot be holding a forced state, so there is
+-- nothing to release. One that accepts it can, and keeps its release.
+--
+-- This also stops the question being re-argued. Whether a zero-watt command
+-- reaches the EMS block has now been settled in both directions inside a
+-- single day -- 1.5.4 opened it, 1.5.6 closed it again. The rule here does not
+-- depend on that answer.
+--
+-- Three failures rather than one for the same reason the read probe uses
+-- three: a busy bus is not proof. A restart clears the count, so the startup
+-- reset is always attempted at least once -- which is the case it exists for.
+local EMS_WRITE_ATTEMPTS = 3
+local ems_write_failures = 0
+
+-- True while the EMS block is still worth writing unprompted.
+local function ems_block_worth_writing()
+    return ems_write_failures < EMS_WRITE_ATTEMPTS
+end
+
+-- Record what the device did with one EMS operation. Counts the operation,
+-- not each of its three registers: the trio goes out together and fails
+-- together, so one rejected trio is one piece of evidence.
+local function note_ems_write(write_err)
+    if write_err == nil then
+        ems_write_failures = 0
+        return
+    end
+    ems_write_failures = ems_write_failures + 1
+    if ems_write_failures == EMS_WRITE_ATTEMPTS then
+        host.log("info", "Sungrow: the EMS control block rejected "
+            .. ems_write_failures .. " writes in a row; treating it as absent "
+            .. "and no longer writing it unprompted")
+    end
+end
+
+----------------------------------------------------------------------------
+
 -- A register that answers on one model and not another. Absence has to be
 -- proved: a single timeout or a busy bus must not silence a register for the
 -- rest of the session, so only a run of failures counts.
+--
+-- Every read driver_poll makes goes through here, including the 5xxx block
+-- that every family is supposed to answer. "Supposed to" is not a guarantee:
+-- a register the inverter never answers costs a failed read on every poll
+-- forever, and the stale-telemetry watchdog then takes the whole site offline
+-- while this driver is still reporting good numbers for everything else. The
+-- control paths below stay on a plain pcall -- they run only when a command
+-- arrives, so they cost the poll nothing, and a poll-time miss must not veto
+-- a later command without trying.
 local MISSES_BEFORE_SKIP = 3
 local miss_counts = {}
 
@@ -262,6 +352,17 @@ end
 -- Ensure power limits allow full charge/discharge (5kW each)
 -- Some Sungrow units ship with discharge capped at 100W
 function configure_power_limits()
+    -- All three registers below are battery limits: charge power, discharge
+    -- power, and the SoC ceiling and floor. A model that named itself a string
+    -- inverter answers none of them, so asking costs three failed reads at
+    -- startup and learns nothing. Each write here is already conditional on
+    -- its read having answered, so skipping the reads skips the writes with
+    -- it -- and none of them clears a forced state, which is why this is the
+    -- one startup path that is safe to gate on the family alone.
+    if known_to_have_no_battery() then
+        return
+    end
+
     -- Max charge power: register 33046, scale 0.01 kW
     local ok_chg, chg = pcall(host.modbus_read, 33046, 1, "holding")
     if ok_chg and chg then
@@ -363,18 +464,18 @@ function driver_poll()
     -- at 0 even while MPPT1/MPPT2 V×I clearly indicate generation. So we
     -- also read the MPPT voltage+current pairs separately and use their
     -- product as a fallback when the top-level register doesn't match.
-    local ok_pv, pv_regs = pcall(host.modbus_read, 5016, 2, "input")
+    local pv_regs = optional_read(5016, 2, "input")
     local pv_w_primary = 0
     local pv_raw_u32 = 0
-    if ok_pv and pv_regs then
+    if pv_regs then
         pv_w_primary = host.decode_u32_le(pv_regs[1], pv_regs[2])
         pv_raw_u32   = pv_w_primary
     end
 
     -- PV MPPT: 5010-5013 (V×0.1, A×0.1 per string)
-    local ok_mppt, mppt_regs = pcall(host.modbus_read, 5010, 4, "input")
+    local mppt_regs = optional_read(5010, 4, "input")
     local mppt1_v, mppt1_a, mppt2_v, mppt2_a = 0, 0, 0, 0
-    if ok_mppt and mppt_regs then
+    if mppt_regs then
         mppt1_v = mppt_regs[1] * 0.1
         mppt1_a = mppt_regs[2] * 0.1
         mppt2_v = mppt_regs[3] * 0.1
@@ -411,24 +512,24 @@ function driver_poll()
     end
 
     -- Rated power: 5000, U16 × 0.1 kW
-    local ok_rated, rated_regs = pcall(host.modbus_read, 5000, 1, "input")
+    local rated_regs = optional_read(5000, 1, "input")
     local rated_w = rated_ac_w
-    if ok_rated and rated_regs then
+    if rated_regs then
         rated_w = rated_regs[1] * 0.1 * 1000
         if rated_w > 0 then rated_ac_w = rated_w end
     end
 
     -- Heatsink temp: 5007, I16 × 0.1 C
-    local ok_temp, temp_regs = pcall(host.modbus_read, 5007, 1, "input")
+    local temp_regs = optional_read(5007, 1, "input")
     local heatsink_c = 0
-    if ok_temp and temp_regs then
+    if temp_regs then
         heatsink_c = host.decode_i16(temp_regs[1]) * 0.1
     end
 
     -- Grid frequency: 5241, U16 × 0.01 Hz
-    local ok_hz, hz_regs = pcall(host.modbus_read, 5241, 1, "input")
+    local hz_regs = optional_read(5241, 1, "input")
     local hz = 0
-    if ok_hz and hz_regs then
+    if hz_regs then
         hz = hz_regs[1] * 0.01
     end
 
@@ -526,6 +627,7 @@ function driver_poll()
         bat_regs = optional_read(13019, 4, "input")
     end
     if bat_regs then
+        battery_confirmed = true
         bat_v   = bat_regs[1] * 0.1
         bat_a   = bat_regs[2] * 0.1
         bat_w   = bat_regs[3]
@@ -581,34 +683,34 @@ function driver_poll()
     end
 
     -- Grid meter power: 5600-5601, I32 LE, watts (positive=import, negative=export)
-    local ok_mw, mw_regs = pcall(host.modbus_read, 5600, 2, "input")
+    local mw_regs = optional_read(5600, 2, "input")
     local meter_w = 0
-    if ok_mw and mw_regs then
+    if mw_regs then
         meter_w = host.decode_i32_le(mw_regs[1], mw_regs[2])
     end
 
     -- Per-phase power: 5602-5607, I32 LE pairs
-    local ok_mp, mp_regs = pcall(host.modbus_read, 5602, 6, "input")
+    local mp_regs = optional_read(5602, 6, "input")
     local l1_w, l2_w, l3_w = 0, 0, 0
-    if ok_mp and mp_regs then
+    if mp_regs then
         l1_w = host.decode_i32_le(mp_regs[1], mp_regs[2])
         l2_w = host.decode_i32_le(mp_regs[3], mp_regs[4])
         l3_w = host.decode_i32_le(mp_regs[5], mp_regs[6])
     end
 
     -- Per-phase voltage: 5740-5742, U16 × 0.1 V
-    local ok_mv, mv_regs = pcall(host.modbus_read, 5740, 3, "input")
+    local mv_regs = optional_read(5740, 3, "input")
     local l1_v, l2_v, l3_v = 0, 0, 0
-    if ok_mv and mv_regs then
+    if mv_regs then
         l1_v = mv_regs[1] * 0.1
         l2_v = mv_regs[2] * 0.1
         l3_v = mv_regs[3] * 0.1
     end
 
     -- Per-phase current: 5743-5745, U16 × 0.01 A
-    local ok_ma, ma_regs = pcall(host.modbus_read, 5743, 3, "input")
+    local ma_regs = optional_read(5743, 3, "input")
     local l1_a, l2_a, l3_a = 0, 0, 0
-    if ok_ma and ma_regs then
+    if ma_regs then
         l1_a = ma_regs[1] * 0.01
         l2_a = ma_regs[2] * 0.01
         l3_a = ma_regs[3] * 0.01
@@ -675,10 +777,47 @@ end
 -- Battery control command handler
 -- EMS convention: positive power_w = charge, negative = discharge
 -- Verified: charge 200W and discharge 200W both tested and confirmed
+--
+-- Do not remove the no-battery guard below. It shipped in 1.2.1 (#17),
+-- was lost when #27 replaced this file with FTW's driver, and #29 restored
+-- only the read half at 1.4.0. Between those, a battery command on a model
+-- this driver had already classified as "string" wrote forced mode, a force
+-- command and a setpoint into the 13xxx block the family does not implement,
+-- and then reported success: the read-back that would have caught it fails on
+-- such a device, and a failed read-back is treated as transient and assumed
+-- good. The host recorded an applied setpoint, renewed the lease on it, and
+-- the planner went on dispatching a battery that is not there.
+--
+-- Refusing follows the shape curtail already uses when rated power is missing:
+-- a warn line naming the reason, and a result the host can report. The code is
+-- the one packages/v1/sungrow/targets/ftw.lua returns, so the two control
+-- paths refuse in the same words rather than drifting apart again.
+--
+-- Two ways to know this device takes a battery command: it named itself a
+-- hybrid, or its battery registers have answered. Everything else is a guess,
+-- and the guess used to be "yes" -- so an SG inverter whose device-type
+-- register never answered still got the EMS writes. Note what this is not:
+-- refusing everything the device type did not positively confirm. A hybrid
+-- whose register 4999 is unreadable reads its battery every poll and reports
+-- its SoC; denying control to a battery the driver is actively reading would
+-- be an outage of its own, and detection giving up is common enough that
+-- DETECT_ATTEMPTS exists for it.
 function driver_command(action, power_w, cmd)
     if action == "init" then
         return true
     elseif action == "battery" then
+        if model_family ~= "hybrid" and not battery_confirmed then
+            local why = model_family == "string"
+                and "this model has no battery registers"
+                or "no battery register has answered on this device"
+            host.log("warn", "Sungrow: battery command refused — " .. why)
+            return false, {
+                status = "rejected",
+                code = "no_battery",
+                message = why,
+                device_state = "unchanged",
+            }
+        end
         return set_battery_power(power_w)
     elseif action == "curtail" then
         return set_pv_curtail_limit(math.abs(power_w))
@@ -726,6 +865,10 @@ function set_battery_power(power_w)
     local cmd_err = host.modbus_write(13050, want_cmd)   -- 2. charge/discharge cmd
     local power_err = host.modbus_write(13051, watts)    -- 3. power setpoint
     local write_err = first_write_error(mode_err, cmd_err, power_err)
+    -- A command always attempts, however many times the block has refused
+    -- before: only the unprompted paths give up. But the outcome still counts,
+    -- and a success here clears the count and puts the release back.
+    note_ems_write(write_err)
     if write_err then
         host.log("warn", "Sungrow: force command write failed: " .. write_err)
         return false
@@ -766,6 +909,9 @@ function set_battery_idle()
     local cmd_err = host.modbus_write(13050, 0xCC)   -- stop forced charge/discharge
     local power_err = host.modbus_write(13051, 0)    -- zero power setpoint
     local write_err = first_write_error(mode_err, cmd_err, power_err)
+    -- Reached by a zero-watt command, which 1.5.4 accepts on every family.
+    -- It still attempts; the count only decides the unprompted paths.
+    note_ems_write(write_err)
     if write_err then
         host.log("warn", "Sungrow: idle write failed: " .. write_err)
         return false
@@ -788,7 +934,21 @@ function set_battery_idle()
 end
 
 -- Return to self-consumption mode (safe default)
+--
+-- Four paths reach this with no command in sight: driver_init's startup reset,
+-- the watchdog, driver_cleanup and the deinit action. The watchdog is the one
+-- that runs on a timer forever, so this is where a device that refuses the
+-- write has to be let go of.
 function set_self_consumption()
+    -- Nothing to hand back on a device that has refused this block three
+    -- times: a write it rejects cannot have latched a forced state. Report the
+    -- default as held rather than failed -- the watchdog reads a false as the
+    -- safe state being unreachable and escalates, which is the wrong answer
+    -- for an inverter that was never under control to begin with.
+    if not ems_block_worth_writing() then
+        return true
+    end
+
     -- Stop first, clear the stale power setpoint, then hand control back to
     -- the inverter. This makes the post-restart state deterministic instead
     -- of leaving e.g. mode=0/cmd=CC/power=880W latched in diagnostics.
@@ -796,6 +956,7 @@ function set_self_consumption()
     local power_err = host.modbus_write(13051, 0)
     local mode_err = host.modbus_write(13049, 0)
     local write_err = first_write_error(cmd_err, power_err, mode_err)
+    note_ems_write(write_err)
     if write_err then
         host.log("warn", "Sungrow: self-consumption reset write failed: " .. write_err)
         return false

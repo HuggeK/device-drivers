@@ -40,10 +40,38 @@ def ftw_sourced_drivers():
 FTW_SOURCED = ftw_sourced_drivers()
 
 
+def valid_ders():
+    """The DER vocabulary, read from the tool that enforces it.
+
+    Two tests used to hand-maintain their own copy of this set, and both were
+    left behind when `ev`, `heatpump` and `vehicle` were added for the drivers
+    promoted from FTW. Nothing noticed, because every driver emitting one of
+    those was byte-identical to its baseline and therefore exempt. Editing one
+    for any reason made two unrelated tests fail on a rule that had already
+    been changed to allow it.
+    """
+    import re
+    path = os.path.join(os.path.dirname(__file__), "..", "..",
+                        "tools", "validate_manifest.py")
+    with open(path) as handle:
+        match = re.search(r"^VALID_DERS\s*=\s*\{([^}]*)\}", handle.read(), re.M)
+    assert match, "VALID_DERS not found in tools/validate_manifest.py"
+    return {name.strip().strip('"\'') for name in match.group(1).split(",")
+            if name.strip()}
+
+
 def skip_if_ftw_sourced(name):
     """Skip a catalog-convention check for a driver FTW owns and tests."""
     if name in FTW_SOURCED:
         pytest.skip(f"{name} is FTW's driver verbatim; FTW tests it in Go")
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "holds_for_ftw_drivers: this check describes runtime behaviour rather "
+        "than a catalog convention, so a driver promoted from FTW is not "
+        "exempt from it")
 
 
 def pytest_collection_modifyitems(items):
@@ -52,12 +80,21 @@ def pytest_collection_modifyitems(items):
     Applied here rather than in each test so that a driver promoted from FTW
     is exempt everywhere at once, and stops being exempt the moment someone
     edits it and it no longer matches the baseline.
+
+    The exemption covers conventions this repository grew and FTW never spoke:
+    spelling, key names, structure. It must not cover a rule about what the
+    driver does on hardware. A check marked `holds_for_ftw_drivers` applies to
+    every driver, promoted or not — the flap that took Pixii and SolarEdge
+    legacy offline lived in promoted drivers, and a blanket exemption is what
+    kept anyone from seeing it.
     """
     if not FTW_SOURCED:
         return
     reason = pytest.mark.skip(
         reason="FTW's driver verbatim; FTW tests it in Go")
     for item in items:
+        if item.get_closest_marker("holds_for_ftw_drivers"):
+            continue
         params = getattr(getattr(item, "callspec", None), "params", {})
         for value in params.values():
             name = getattr(value, "stem", None) or (

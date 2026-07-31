@@ -7,8 +7,14 @@ ARTIFACT_DIR ?= .artifacts/$(ID)
 LEVEL ?= patch
 
 .PHONY: bootstrap new-driver test-driver package-driver check boundary \
+	refused-write-report absent-register-report \
 	sync-manifests bump-driver history ftw-baseline ftw-baseline-report \
-	host-api watch-upstream-docs
+	host-api site watch-upstream-docs
+
+# Build the public driver catalog page into site/, exactly as GitHub Pages
+# publishes it. Open site/index.html to review a change before it ships.
+site:
+	uv run --frozen --extra package --extra dev python tools/generate_site.py --output site
 
 # Does any driver call a host function no host provides?
 host-api:
@@ -22,6 +28,19 @@ ftw-baseline:
 # Show what stands between each FTW baseline and a catalog driver.
 ftw-baseline-report:
 	uv run --frozen --extra package --extra dev python tools/import_ftw_baseline.py --report
+
+# Which registers a driver reads forever while still reporting telemetry.
+# Every one takes the driver offline on hardware that omits that register.
+absent-register-report:
+	test -n "$(ID)"
+	./lua55 drivers/tests/lua_harness/absent_register_probe.lua . "drivers/lua/$(ID).lua"
+
+# Does this driver keep writing a register the device refuses? The watchdog
+# reaches driver_default_mode on a timer, so anything but a settled count
+# repeats for the life of the session.
+refused-write-report:
+	test -n "$(ID)"
+	./lua55 drivers/tests/lua_harness/refused_write_probe.lua . "drivers/lua/$(ID).lua"
 
 bootstrap:
 	uv sync --frozen --extra package --extra dev
