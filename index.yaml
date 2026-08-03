@@ -440,8 +440,8 @@ drivers:
     setup: [device_screen]
     ders: [heatpump]
     control: true
-    size_bytes: 35392
-    sha256: "45de584f49c5a4708f6fe96201806e95e77ada361088f7f16b02ae70f85df6ab"
+    size_bytes: 35431
+    sha256: "f4bc18ddbf187cdbd84202d81b1417b141e4cc071643c2362f87e03bf1fb60c9"
   - name: "opendtu"
     version: "1.0.2"
     tier: community
