@@ -4,6 +4,8 @@
 
 Restore the current session after restart even when Easee fills sessionEnd during a pause. Keep the ID when the car stops drawing; revoke it on a real unplug. Retain each measurement's source time and omit an old no-current reason while fresh charging power flows. Cloud offline state no longer reports a cable unplug.
 
+Recheck session identity after offline or unreadable observations. Spread failed session lookups across the hour, with an earlier attempt when charging starts or the session changes.
+
 All notable changes to drivers in this repository are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).

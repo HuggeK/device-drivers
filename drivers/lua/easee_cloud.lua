@@ -282,12 +282,27 @@ local OBS_SESSION_START   = 223
 
 local OBS_IDS = "48,96,103,109,120,121,124,183,194,223"
 
+local validated_session_id = nil
+local observed_session_id = nil
+local departed_session_id = nil
+local session_lookups_ms = {}
+local last_session_lookup_ms = nil
+local last_session_mode = nil
+
+local function invalidate_session_proof()
+    -- An unreadable charger may have changed cars during the gap. Keep the
+    -- gap unknown, but require fresh proof when observations return.
+    validated_session_id = nil
+    observed_session_id = nil
+    last_session_mode = nil
+end
+
 local function get_observations(serial)
     local url = "https://api.easee.com/state/" .. serial .. "/observations?ids=" .. OBS_IDS
     local resp, err = safe_http_get(url, auth_headers())
-    if err then return nil, err end
+    if err then invalidate_session_proof(); return nil, err end
     local decoded = safe_json_decode(resp)
-    if type(decoded) ~= "table" then return nil, "decode failed" end
+    if type(decoded) ~= "table" then invalidate_session_proof(); return nil, "decode failed" end
     local list = decoded.observations or decoded
     local obs = {}
     local timestamps = {}
@@ -299,11 +314,16 @@ local function get_observations(serial)
     end
     local mode = obs[OBS_OP_MODE]
     if type(mode) ~= "number" or mode < 0 or mode > 6 or mode % 1 ~= 0 then
+        invalidate_session_proof()
         return nil, "missing charger state"
     end
-    if mode == 0 then return nil, "charger offline; connection unknown" end
+    if mode == 0 then
+        invalidate_session_proof()
+        return nil, "charger offline; connection unknown"
+    end
     if mode >= 2 and (type(obs[OBS_TOTAL_POWER]) ~= "number" or
        type(obs[OBS_SESSION_ENERGY]) ~= "number" or obs[OBS_SESSION_ENERGY] < 0) then
+        invalidate_session_proof()
         return nil, "missing session measurement"
     end
     return obs, nil, timestamps
@@ -315,12 +335,6 @@ end
 -- or stopped drawing. Keep the same identity until disconnect or a new ID.
 -- https://developer.easee.com/reference/chargers_getongoingsessiondetails
 -- https://developer.easee.com/docs/api-command-and-control
-local validated_session_id = nil
-local observed_session_id = nil
-local departed_session_id = nil
-local session_lookups_ms = {}
-local last_session_lookup_ms = nil
-
 local function normalized_session_start(value)
     if type(value) ~= "string" or
        not value:match("^%d%d%d%d%-%d%d%-%d%dT%d%d:%d%d:%d%d") then return nil end
@@ -328,6 +342,8 @@ local function normalized_session_start(value)
 end
 
 local function current_session_id(obs, op_mode)
+    local began_charging = op_mode == 3 and last_session_mode ~= 3
+    last_session_mode = op_mode
     if op_mode == 0 or op_mode == 1 then
         if op_mode == 1 then departed_session_id = observed_session_id or departed_session_id end
         validated_session_id = nil
@@ -343,7 +359,8 @@ local function current_session_id(obs, op_mode)
     if not id or id <= 0 or id % 1 ~= 0 or not start then return nil end
     local identity = string.format("%.0f", id) .. ":" .. start
     if identity == departed_session_id then return nil end
-    if identity ~= observed_session_id then
+    local identity_changed = identity ~= observed_session_id
+    if identity_changed then
         observed_session_id = identity
         validated_session_id = nil
     end
@@ -358,7 +375,10 @@ local function current_session_id(obs, op_mode)
         if now - at < 3600000 then table.insert(recent, at) end
     end
     session_lookups_ms = recent
-    if #recent >= 10 or (last_session_lookup_ms and now - last_session_lookup_ms < 60000) then
+    -- Spread failed retries across the hour. A new session or a transition to
+    -- charging may try sooner, while retaining the minute and hourly limits.
+    local retry_ms = (identity_changed or began_charging) and 60000 or 360000
+    if #recent >= 10 or (last_session_lookup_ms and now - last_session_lookup_ms < retry_ms) then
         return nil
     end
     last_session_lookup_ms = now

@@ -67,7 +67,7 @@ driver_poll()
 assert(#host._emitted.ev == before,"failed read invented fresh telemetry")
 boot()
 host._http_responses["/sessions/ongoing"] = host.json_encode({sessionId=99,sessionStart="2026-01-01T08:00:00Z"})
-for i=1,20 do
+for i=1,59 do
     host._millis_counter = host._millis_counter + 61000
     assert(poll(3,current).session_id == nil,"mismatched session accepted during retries")
 end
@@ -152,3 +152,34 @@ host._http_responses["/observations?ids="] = host.json_encode({
 driver_poll()
 sample=host._emitted.ev[#host._emitted.ev]
 assert(sample.reason_no_current == 5, "old power hid a newer no-current reason")
+
+-- A car may be replaced while the charger is offline. Historical observation
+-- 223 must not reuse proof from before the outage when telemetry returns.
+for _, failed in ipairs({host.json_encode({{id=109,value=0}}), 'not-json', '{}'}) do
+    boot()
+    assert(poll(3,current).session_id == canonical)
+    local count=#host._emitted.ev
+    host._http_responses["/observations?ids="] = failed
+    driver_poll()
+    assert(#host._emitted.ev == count,"outage emitted a new physical state")
+    host._millis_counter = host._millis_counter + 61000
+    host._http_responses["/sessions/ongoing"] = host.json_encode({sessionId=101,sessionStart="2026-01-02T08:00:00Z"})
+    assert(poll(2,current).session_id == nil,"offline proof restored an old vehicle")
+    host._millis_counter = host._millis_counter + 61000
+    assert(poll(3,next,1,1010).session_id == "101:2026-01-02T08:00:00Z","current vehicle did not regain proof")
+end
+
+-- Mismatched paused telemetry must leave quota for when charging starts.
+boot()
+host._http_responses["/sessions/ongoing"] = '{}'
+for i=1,10 do
+    assert(poll(2,current).session_id == nil)
+    host._millis_counter = host._millis_counter + 61000
+end
+lookups=0
+for _, call in ipairs(host._calls) do
+    if call.func=="http_get" and call.args[1]:find("/sessions/ongoing",1,true) then lookups=lookups+1 end
+end
+assert(lookups <= 2,"paused retries exhausted the lookup quota: "..lookups)
+host._http_responses["/sessions/ongoing"] = host.json_encode({sessionId=100,sessionStart="2026-01-01T08:00:00Z"})
+assert(poll(3,current).session_id == canonical,"charging could not verify its session after paused retries")
