@@ -309,17 +309,15 @@ local function get_observations(serial)
     return obs, nil, timestamps
 end
 
--- Observation 223 identifies an energy session. That session can end before
--- the cable is removed, so it is not enough to restore a prior car's level.
--- Validate an open session against the sessions API once, then retain its
--- identity through pauses in this driver process until a completed session.
--- Completion or a fresh process needs open-session proof again; an offline car may
--- need its battery level confirmed. Neither endpoint proves a paused car's
--- identity after an ended session.
--- https://developer.easee.com/docs/charger-observation-ids
+-- Match observation 223 to the vendor's current-session endpoint. sessionEnd
+-- can be populated while a car is merely paused; it is not cable-disconnect
+-- proof (confirmed on hardware, 2026-09-13). Mode 4 also means the car paused
+-- or stopped drawing. Keep the same identity until disconnect or a new ID.
 -- https://developer.easee.com/reference/chargers_getongoingsessiondetails
+-- https://developer.easee.com/docs/api-command-and-control
 local validated_session_id = nil
 local observed_session_id = nil
+local departed_session_id = nil
 local session_lookups_ms = {}
 local last_session_lookup_ms = nil
 
@@ -330,7 +328,8 @@ local function normalized_session_start(value)
 end
 
 local function current_session_id(obs, op_mode)
-    if op_mode == 0 or op_mode == 1 or op_mode == 4 then
+    if op_mode == 0 or op_mode == 1 then
+        if op_mode == 1 then departed_session_id = observed_session_id or departed_session_id end
         validated_session_id = nil
         observed_session_id = nil
         return nil
@@ -343,6 +342,7 @@ local function current_session_id(obs, op_mode)
     local start = normalized_session_start(session.Start)
     if not id or id <= 0 or id % 1 ~= 0 or not start then return nil end
     local identity = string.format("%.0f", id) .. ":" .. start
+    if identity == departed_session_id then return nil end
     if identity ~= observed_session_id then
         observed_session_id = identity
         validated_session_id = nil
@@ -367,8 +367,7 @@ local function current_session_id(obs, op_mode)
     if err then return nil end
     local ongoing = safe_json_decode(body)
     if type(ongoing) ~= "table" or tonumber(ongoing.sessionId) ~= id or
-       normalized_session_start(ongoing.sessionStart) ~= start or
-       (ongoing.sessionEnd ~= nil and ongoing.sessionEnd ~= "") then return nil end
+       normalized_session_start(ongoing.sessionStart) ~= start then return nil end
     validated_session_id = identity
     return identity
 end

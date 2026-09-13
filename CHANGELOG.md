@@ -2,7 +2,7 @@
 
 ## easee_cloud 1.3.2
 
-Verify paused open sessions after restart, retain each measurement's source time, and omit an old no-current reason while fresh charging power flows. Cloud offline state no longer reports a cable unplug.
+Restore the current session after restart even when Easee fills sessionEnd during a pause. Keep the ID when the car stops drawing; revoke it on a real unplug. Retain each measurement's source time and omit an old no-current reason while fresh charging power flows. Cloud offline state no longer reports a cable unplug.
 
 All notable changes to drivers in this repository are documented here.
 
