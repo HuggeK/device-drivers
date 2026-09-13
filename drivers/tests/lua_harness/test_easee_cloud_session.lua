@@ -32,7 +32,9 @@ assert(poll(3,current).session_id == canonical,"identity changed on driver resta
 assert(poll(2,current).session_id == canonical,"a pause lost the confirmed session")
 assert(poll(6,current).session_id == canonical,"ready mode lost the confirmed session")
 boot()
-assert(poll(2,current).session_id == nil,"restart inferred a paused car's identity")
+assert(poll(2,current).session_id == canonical,"paused open session was not verified after restart")
+boot(true)
+assert(poll(2,current).session_id == nil,"paused ended session restored a previous car")
 boot(true)
 assert(poll(3,current).session_id == nil,"closed API session passed as active")
 boot()
@@ -117,3 +119,35 @@ for _, payload in ipairs({"true", "false", "42", '"error"', "null", "[]", "{}"})
     assert(sample.connected and sample.w == 4300, "ongoing payload dropped fresh charger readings")
 end
 print("Easee current-session identity: passed")
+
+boot()
+host._http_responses["/observations?ids="] = host.json_encode({
+ {id=109,value=3,timestamp="2026-01-01T08:02:00Z"},
+ {id=120,value=6.9,timestamp="2026-01-01T08:03:00Z"},
+ {id=121,value=9,timestamp="2026-01-01T08:00:00Z"},
+ {id=96,value=5,timestamp="2026-01-01T08:01:00Z"},
+ {id=223,value=current},
+})
+driver_poll()
+local sample=host._emitted.ev[#host._emitted.ev]
+assert(sample.power_observed_at == "2026-01-01T08:03:00Z")
+assert(sample.energy_observed_at == "2026-01-01T08:00:00Z")
+assert(sample.state_observed_at == "2026-01-01T08:02:00Z")
+assert(sample.reason_observed_at == "2026-01-01T08:01:00Z")
+assert(sample.reason_no_current == nil and sample.reason_no_current_label == nil, "charging reported an old no-current reason")
+
+local emitted=#host._emitted.ev
+host._http_responses["/observations?ids="] = host.json_encode({{id=109,value=0}})
+driver_poll()
+assert(#host._emitted.ev == emitted,"cloud offline state invented an unplug")
+
+boot()
+host._http_responses["/observations?ids="] = host.json_encode({
+ {id=109,value=3,timestamp="2026-01-01T08:02:00Z"},
+ {id=120,value=6.9,timestamp="2026-01-01T08:03:00Z"},
+ {id=121,value=9,timestamp="2026-01-01T08:00:00Z"},
+ {id=96,value=5,timestamp="2026-01-01T08:04:00Z"},
+})
+driver_poll()
+sample=host._emitted.ev[#host._emitted.ev]
+assert(sample.reason_no_current == 5, "old power hid a newer no-current reason")

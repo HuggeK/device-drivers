@@ -1,5 +1,9 @@
 # Changelog
 
+## easee_cloud 1.3.2
+
+Verify paused open sessions after restart, retain each measurement's source time, and omit an old no-current reason while fresh charging power flows. Cloud offline state no longer reports a cable unplug.
+
 All notable changes to drivers in this repository are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
