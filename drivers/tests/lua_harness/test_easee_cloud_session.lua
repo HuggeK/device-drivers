@@ -131,6 +131,7 @@ host._http_responses["/observations?ids="] = host.json_encode({
 driver_poll()
 local sample=host._emitted.ev[#host._emitted.ev]
 assert(sample.power_observed_at == "2026-01-01T08:03:00Z")
+assert(sample.power_max_age_s == 180)
 assert(sample.energy_observed_at == "2026-01-01T08:00:00Z")
 assert(sample.state_observed_at == "2026-01-01T08:02:00Z")
 assert(sample.reason_observed_at == "2026-01-01T08:01:00Z")

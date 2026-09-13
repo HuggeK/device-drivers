@@ -654,6 +654,9 @@ function driver_poll()
         request_active          = request_active,
         session_wh              = session_wh,
         power_observed_at       = timestamps[OBS_TOTAL_POWER],
+        -- Two-minute source updates were observed on hardware. One minute
+        -- of margin bounds the power estimate without refreshing its time.
+        power_max_age_s         = 180,
         energy_observed_at      = timestamps[OBS_SESSION_ENERGY],
         state_observed_at       = timestamps[OBS_OP_MODE],
         reason_observed_at      = timestamps[OBS_REASON_NO_CUR],
