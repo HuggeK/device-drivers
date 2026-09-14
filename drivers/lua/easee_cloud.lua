@@ -25,7 +25,7 @@ DRIVER = {
   id           = "easee-cloud",
   name         = "Easee Cloud",
   manufacturer = "Easee",
-  version      = "1.3.1",
+  version      = "1.3.2",
   protocols    = { "http" },
   capabilities = { "ev" },
   description  = "Easee Home/Charge via Cloud REST API. No local protocol needed.",
@@ -282,44 +282,59 @@ local OBS_SESSION_START   = 223
 
 local OBS_IDS = "48,96,103,109,120,121,124,183,194,223"
 
+local validated_session_id = nil
+local observed_session_id = nil
+local departed_session_id = nil
+local session_lookups_ms = {}
+local last_session_lookup_ms = nil
+local last_session_mode = nil
+
+local function invalidate_session_proof()
+    -- An unreadable charger may have changed cars during the gap. Keep the
+    -- gap unknown, but require fresh proof when observations return.
+    validated_session_id = nil
+    observed_session_id = nil
+    last_session_mode = nil
+end
+
 local function get_observations(serial)
     local url = "https://api.easee.com/state/" .. serial .. "/observations?ids=" .. OBS_IDS
     local resp, err = safe_http_get(url, auth_headers())
-    if err then return nil, err end
+    if err then invalidate_session_proof(); return nil, err end
     local decoded = safe_json_decode(resp)
-    if type(decoded) ~= "table" then return nil, "decode failed" end
+    if type(decoded) ~= "table" then invalidate_session_proof(); return nil, "decode failed" end
     local list = decoded.observations or decoded
     local obs = {}
+    local timestamps = {}
     for _, item in ipairs(list) do
         if item.id then
             obs[item.id] = tonumber(item.value) or item.value
+            timestamps[item.id] = item.timestamp
         end
     end
     local mode = obs[OBS_OP_MODE]
     if type(mode) ~= "number" or mode < 0 or mode > 6 or mode % 1 ~= 0 then
+        invalidate_session_proof()
         return nil, "missing charger state"
+    end
+    if mode == 0 then
+        invalidate_session_proof()
+        return nil, "charger offline; connection unknown"
     end
     if mode >= 2 and (type(obs[OBS_TOTAL_POWER]) ~= "number" or
        type(obs[OBS_SESSION_ENERGY]) ~= "number" or obs[OBS_SESSION_ENERGY] < 0) then
+        invalidate_session_proof()
         return nil, "missing session measurement"
     end
-    return obs, nil
+    return obs, nil, timestamps
 end
 
--- Observation 223 identifies an energy session. That session can end before
--- the cable is removed, so it is not enough to restore a prior car's level.
--- Validate an active session against the sessions API once, then retain its
--- identity through pauses in this driver process until a completed session.
--- Completion or a fresh process needs active proof again; an offline car may
--- need its battery level confirmed. Neither endpoint proves a paused car's
--- identity after an ended session.
--- https://developer.easee.com/docs/charger-observation-ids
+-- Match observation 223 to the vendor's current-session endpoint. sessionEnd
+-- can be populated while a car is merely paused; it is not cable-disconnect
+-- proof (confirmed on hardware, 2026-09-13). Mode 4 also means the car paused
+-- or stopped drawing. Keep the same identity until disconnect or a new ID.
 -- https://developer.easee.com/reference/chargers_getongoingsessiondetails
-local validated_session_id = nil
-local observed_session_id = nil
-local session_lookups_ms = {}
-local last_session_lookup_ms = nil
-
+-- https://developer.easee.com/docs/api-command-and-control
 local function normalized_session_start(value)
     if type(value) ~= "string" or
        not value:match("^%d%d%d%d%-%d%d%-%d%dT%d%d:%d%d:%d%d") then return nil end
@@ -327,7 +342,10 @@ local function normalized_session_start(value)
 end
 
 local function current_session_id(obs, op_mode)
-    if op_mode == 0 or op_mode == 1 or op_mode == 4 then
+    local began_charging = op_mode == 3 and last_session_mode ~= 3
+    last_session_mode = op_mode
+    if op_mode == 0 or op_mode == 1 then
+        if op_mode == 1 then departed_session_id = observed_session_id or departed_session_id end
         validated_session_id = nil
         observed_session_id = nil
         return nil
@@ -340,14 +358,15 @@ local function current_session_id(obs, op_mode)
     local start = normalized_session_start(session.Start)
     if not id or id <= 0 or id % 1 ~= 0 or not start then return nil end
     local identity = string.format("%.0f", id) .. ":" .. start
-    if identity ~= observed_session_id then
+    if identity == departed_session_id then return nil end
+    local identity_changed = identity ~= observed_session_id
+    if identity_changed then
         observed_session_id = identity
         validated_session_id = nil
     end
     if validated_session_id == identity then return identity end
-    -- A completed or awaiting session can belong to an earlier car. Do not
-    -- turn that into automatic battery-level restoration after restart.
-    if op_mode ~= 3 or (obs[OBS_TOTAL_POWER] or 0) < 0.1 then return nil end
+    -- A pause is still an open session. Ask the ongoing-session endpoint
+    -- before restoring its identity; observation 223 alone may be historical.
 
     -- The vendor allows ten requests per hour, not one per normal poll.
     local now = host.millis()
@@ -356,7 +375,10 @@ local function current_session_id(obs, op_mode)
         if now - at < 3600000 then table.insert(recent, at) end
     end
     session_lookups_ms = recent
-    if #recent >= 10 or (last_session_lookup_ms and now - last_session_lookup_ms < 60000) then
+    -- Spread failed retries across the hour. A new session or a transition to
+    -- charging may try sooner, while retaining the minute and hourly limits.
+    local retry_ms = (identity_changed or began_charging) and 60000 or 360000
+    if #recent >= 10 or (last_session_lookup_ms and now - last_session_lookup_ms < retry_ms) then
         return nil
     end
     last_session_lookup_ms = now
@@ -365,8 +387,7 @@ local function current_session_id(obs, op_mode)
     if err then return nil end
     local ongoing = safe_json_decode(body)
     if type(ongoing) ~= "table" or tonumber(ongoing.sessionId) ~= id or
-       normalized_session_start(ongoing.sessionStart) ~= start or
-       (ongoing.sessionEnd ~= nil and ongoing.sessionEnd ~= "") then return nil end
+       normalized_session_start(ongoing.sessionStart) ~= start then return nil end
     validated_session_id = identity
     return identity
 end
@@ -562,7 +583,7 @@ function driver_poll()
         return 10000
     end
 
-    local obs, err = get_observations(charger_serial)
+    local obs, err, timestamps = get_observations(charger_serial)
     if err or not obs then
         host.log("warn", "Easee: observations poll failed: " .. redact_http_err(err))
         return 10000
@@ -579,6 +600,13 @@ function driver_poll()
     local is_online = (op_mode ~= 0)
 
     local reason_code = obs[OBS_REASON_NO_CUR]
+    -- ReasonForNoCurrent describes a blocked offer. An older reason is not
+    -- a current fault while the charger reports both charging and power.
+    local reason_at = normalized_session_start(timestamps[OBS_REASON_NO_CUR])
+    local power_at = normalized_session_start(timestamps[OBS_TOTAL_POWER])
+    if charging and power_w > 100 and reason_at and power_at and reason_at <= power_at then
+        reason_code = nil
+    end
     local cable_locked = obs[OBS_CABLE_LOCKED]
     if cable_locked ~= nil then cable_locked = (cable_locked == 1 or cable_locked == true) end
     local dyn_current = obs[OBS_DYN_CURRENT]
@@ -645,6 +673,13 @@ function driver_poll()
         charging                = charging,
         request_active          = request_active,
         session_wh              = session_wh,
+        power_observed_at       = timestamps[OBS_TOTAL_POWER],
+        -- Two-minute source updates were observed on hardware. One minute
+        -- of margin bounds the power estimate without refreshing its time.
+        power_max_age_s         = 180,
+        energy_observed_at      = timestamps[OBS_SESSION_ENERGY],
+        state_observed_at       = timestamps[OBS_OP_MODE],
+        reason_observed_at      = timestamps[OBS_REASON_NO_CUR],
         session_id              = current_session_id(obs, op_mode),
         op_mode                 = op_mode,                     -- 1=disc,2=awaiting,3=charging,4=completed,5=error,6=ready
         state_label             = OP_MODE_LABELS[op_mode] or "unknown",

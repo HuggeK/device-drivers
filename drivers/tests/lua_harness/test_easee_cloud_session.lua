@@ -26,15 +26,17 @@ local canonical = "100:2026-01-01T08:00:00Z"
 local current = host.json_encode({Id=100,Start=start,MeterValue=1000})
 boot()
 assert(poll(3,current).session_id == canonical,"current session missing")
-assert(poll(4,current).session_id == nil,"completed session retained active proof")
+assert(poll(4,current).session_id == canonical,"car stopping erased its session")
 boot()
 assert(poll(3,current).session_id == canonical,"identity changed on driver restart")
 assert(poll(2,current).session_id == canonical,"a pause lost the confirmed session")
 assert(poll(6,current).session_id == canonical,"ready mode lost the confirmed session")
 boot()
-assert(poll(2,current).session_id == nil,"restart inferred a paused car's identity")
+assert(poll(2,current).session_id == canonical,"paused open session was not verified after restart")
 boot(true)
-assert(poll(3,current).session_id == nil,"closed API session passed as active")
+assert(poll(2,current).session_id == canonical,"sessionEnd during a pause blocked restoration")
+boot(true)
+assert(poll(3,current).session_id == canonical,"sessionEnd during charging blocked restoration")
 boot()
 assert(poll(3,current,9,1000).session_id == canonical,"lagging lifetime counter blocked a verified active session")
 for i=1,20 do assert(poll(3,current).session_id == canonical) end
@@ -63,10 +65,11 @@ assert(#host._emitted.ev == before,"broken JSON invented fresh telemetry")
 host._http_responses["/observations?ids="] = nil
 driver_poll()
 assert(#host._emitted.ev == before,"failed read invented fresh telemetry")
-boot(true)
-for i=1,20 do
+boot()
+host._http_responses["/sessions/ongoing"] = host.json_encode({sessionId=99,sessionStart="2026-01-01T08:00:00Z"})
+for i=1,59 do
     host._millis_counter = host._millis_counter + 61000
-    assert(poll(3,current).session_id == nil,"ended session accepted during retries")
+    assert(poll(3,current).session_id == nil,"mismatched session accepted during retries")
 end
 lookups=0
 for _, call in ipairs(host._calls) do
@@ -74,17 +77,16 @@ for _, call in ipairs(host._calls) do
 end
 assert(lookups==10,"ongoing-session API exceeded ten requests per hour: "..lookups)
 
--- A car can be swapped between polls while observation 223 still describes
--- its predecessor. Once completion was seen, pauses cannot reuse that proof.
-boot()
+-- Stopping energy flow is not removing the cable. A real observed unplug
+-- does revoke this identity even if the cloud endpoints still carry old data.
+boot(true)
 assert(poll(3,current).session_id == canonical)
-host._http_responses["/sessions/ongoing"] = host.json_encode({sessionId=100,sessionStart="2026-01-01T08:00:00Z",sessionEnd="2026-01-01T09:00:00Z"})
-assert(poll(4,current).session_id == nil,"completion kept the previous car's proof")
-assert(poll(2,current).session_id == nil,"awaiting car reused completed session")
-assert(poll(6,current).session_id == nil,"ready car reused completed session")
+assert(poll(4,current).session_id == canonical,"car pause lost its identity")
+assert(poll(2,current).session_id == canonical,"waiting car lost its identity")
+assert(poll(6,current).session_id == canonical,"ready car lost its identity")
+assert(poll(1,current).session_id == nil,"unplug retained identity")
 host._millis_counter = host._millis_counter + 61000
-assert(poll(3,current).session_id == nil,"ended API session passed active revalidation")
-host._millis_counter = host._millis_counter + 61000
+assert(poll(2,current).session_id == nil,"new connection reused departed session")
 host._http_responses["/sessions/ongoing"] = host.json_encode({sessionId=101,sessionStart="2026-01-02T08:00:00Z"})
 assert(poll(3,next,1,1010).session_id == "101:2026-01-02T08:00:00Z","new active session did not regain proof")
 
@@ -117,3 +119,67 @@ for _, payload in ipairs({"true", "false", "42", '"error"', "null", "[]", "{}"})
     assert(sample.connected and sample.w == 4300, "ongoing payload dropped fresh charger readings")
 end
 print("Easee current-session identity: passed")
+
+boot()
+host._http_responses["/observations?ids="] = host.json_encode({
+ {id=109,value=3,timestamp="2026-01-01T08:02:00Z"},
+ {id=120,value=6.9,timestamp="2026-01-01T08:03:00Z"},
+ {id=121,value=9,timestamp="2026-01-01T08:00:00Z"},
+ {id=96,value=5,timestamp="2026-01-01T08:01:00Z"},
+ {id=223,value=current},
+})
+driver_poll()
+local sample=host._emitted.ev[#host._emitted.ev]
+assert(sample.power_observed_at == "2026-01-01T08:03:00Z")
+assert(sample.power_max_age_s == 180)
+assert(sample.energy_observed_at == "2026-01-01T08:00:00Z")
+assert(sample.state_observed_at == "2026-01-01T08:02:00Z")
+assert(sample.reason_observed_at == "2026-01-01T08:01:00Z")
+assert(sample.reason_no_current == nil and sample.reason_no_current_label == nil, "charging reported an old no-current reason")
+
+local emitted=#host._emitted.ev
+host._http_responses["/observations?ids="] = host.json_encode({{id=109,value=0}})
+driver_poll()
+assert(#host._emitted.ev == emitted,"cloud offline state invented an unplug")
+
+boot()
+host._http_responses["/observations?ids="] = host.json_encode({
+ {id=109,value=3,timestamp="2026-01-01T08:02:00Z"},
+ {id=120,value=6.9,timestamp="2026-01-01T08:03:00Z"},
+ {id=121,value=9,timestamp="2026-01-01T08:00:00Z"},
+ {id=96,value=5,timestamp="2026-01-01T08:04:00Z"},
+})
+driver_poll()
+sample=host._emitted.ev[#host._emitted.ev]
+assert(sample.reason_no_current == 5, "old power hid a newer no-current reason")
+
+-- A car may be replaced while the charger is offline. Historical observation
+-- 223 must not reuse proof from before the outage when telemetry returns.
+for _, failed in ipairs({host.json_encode({{id=109,value=0}}), 'not-json', '{}'}) do
+    boot()
+    assert(poll(3,current).session_id == canonical)
+    local count=#host._emitted.ev
+    host._http_responses["/observations?ids="] = failed
+    driver_poll()
+    assert(#host._emitted.ev == count,"outage emitted a new physical state")
+    host._millis_counter = host._millis_counter + 61000
+    host._http_responses["/sessions/ongoing"] = host.json_encode({sessionId=101,sessionStart="2026-01-02T08:00:00Z"})
+    assert(poll(2,current).session_id == nil,"offline proof restored an old vehicle")
+    host._millis_counter = host._millis_counter + 61000
+    assert(poll(3,next,1,1010).session_id == "101:2026-01-02T08:00:00Z","current vehicle did not regain proof")
+end
+
+-- Mismatched paused telemetry must leave quota for when charging starts.
+boot()
+host._http_responses["/sessions/ongoing"] = '{}'
+for i=1,10 do
+    assert(poll(2,current).session_id == nil)
+    host._millis_counter = host._millis_counter + 61000
+end
+lookups=0
+for _, call in ipairs(host._calls) do
+    if call.func=="http_get" and call.args[1]:find("/sessions/ongoing",1,true) then lookups=lookups+1 end
+end
+assert(lookups <= 2,"paused retries exhausted the lookup quota: "..lookups)
+host._http_responses["/sessions/ongoing"] = host.json_encode({sessionId=100,sessionStart="2026-01-01T08:00:00Z"})
+assert(poll(3,current).session_id == canonical,"charging could not verify its session after paused retries")
